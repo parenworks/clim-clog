@@ -1,0 +1,78 @@
+#+TITLE: clim-clog
+#+OPTIONS: toc:nil num:nil
+
+A [[https://mcclim.common-lisp.dev/][McCLIM]] backend that renders to an *HTML5 ~<canvas>~ in a web browser*,
+driven over a [[https://github.com/rabbibotton/clog][CLOG]] websocket connection.
+
+The goal is to investigate putting CLIM applications on the web by reusing
+CLOG as the transport + drawing surface, instead of inventing a new one.
+This is the concrete spike that came out of the "map CLIM onto websockets +
+CLOG" discussion.
+
+* Status
+
+*v0.0.1 - Phase 0: output-only spike.*
+
+| Area                                                                            | State                               |
+|---------------------------------------------------------------------------------+-------------------------------------|
+| Port / graft / frame-manager skeleton                                           | done (modelled on ~Backends/Null~)  |
+| Medium drawing (line, lines, polygon, rectangle(s), point(s), ellipse, text)    | done, delegating to CLOG canvas     |
+| Solid-colour inks                                                               | done                                |
+| Text metrics                                                                    | approximate (offline estimate)      |
+| Coordinate transformations                                                      | applied per-op                      |
+| Line dashes, clipping regions, gradients/patterns                               | *not yet*                           |
+| Mirrored top-level sheets / real frames & panes                                 | *not yet* (Phase 1)                 |
+| Input (pointer / keyboard)                                                      | *not yet* (Phase 2)                 |
+
+See [[file:DESIGN.org][DESIGN.org]] for the architecture and full roadmap.
+
+* Why CLOG
+
+~clog-canvas.lisp~ is a near 1:1 Lisp wrapper over the HTML5 Canvas 2D API
+(~begin-path~, ~move-to~, ~line-to~, ~arc~, ~path-fill~, ~path-stroke~,
+~fill-text~, ~measure-text~, transforms, ...). Where the McCLIM HTML5
+backend tutorial emits JavaScript /strings/, here we call the equivalent
+CLOG method and let CLOG marshal it over the websocket. CLOG's
+bidirectional connection also gives us the pointer/keyboard events we will
+need for interactivity in Phase 2, and it already ships a listener/editor
+(CLOG Builder).
+
+* Dependencies
+
+- A Common Lisp with McCLIM available (~clim-core~).
+- CLOG (~clog~) - via Ultralisp or git.
+
+Local clones used during development live at ~~/SourceCode/McCLIM~ and
+~~/SourceCode/clog~ (kept current with their upstreams).
+
+* Running the smoke test
+
+#+begin_src lisp
+(ql:quickload :clim-clog/examples)
+(clim-clog::start)        ; opens http://127.0.0.1:8080 in your browser
+;; ... a canvas with rectangles, a line, a polygon, an ellipse, points
+;;     and a line of text should appear ...
+(clim-clog::stop)
+#+end_src
+
+If the demo scene renders, the CLIM->CLOG drawing mapping is working and the
+spike has answered its question: *yes, a CLIM medium can drive a browser
+canvas through CLOG.* The next question (interactivity) is Phase 2.
+
+* Layout
+
+#+begin_example
+clim-clog.asd            ; "clim-clog" core + "clim-clog/examples"
+src/
+  package.lisp           ; CLIM-CLOG package
+  port.lisp              ; CLOG-PORT: wraps the CLOG connection + canvas/context
+  graft.lisp             ; CLOG-GRAFT: the drawing surface as a sheet
+  medium.lisp            ; CLOG-MEDIUM: the CLIM -> CLOG canvas drawing map
+  frame-manager.lisp     ; CLOG-FRAME-MANAGER: minimal for now
+examples/
+  hello.lisp             ; runnable output-only smoke test
+#+end_example
+
+* License
+
+BSD-3-Clause (matching CLOG; McCLIM is LGPL-2.1+).

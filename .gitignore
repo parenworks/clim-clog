@@ -1,0 +1,19 @@
+## Common Lisp compiled output
+*.fasl
+*.fas
+*.lx64fsl
+*.lx32fsl
+*.dx64fsl
+*.dx32fsl
+*.x86f
+*.abcl
+
+## Build artifacts / images
+/bin/
+*.core
+*.image
+
+## Editor / OS cruft
+*~
+\#*\#
+.DS_Store

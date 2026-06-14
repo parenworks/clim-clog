@@ -1,0 +1,210 @@
+#+TITLE: clim-clog - Design & Roadmap
+#+OPTIONS: toc:nil num:nil
+
+This document records /what we are building, why, and in what order/, so the
+investigation stays legible as it grows.
+
+* The question we are answering
+
+Fade's framing: a CLIM-based "Lisp machine" UI implies CLIM, but a web
+interface "would require a side project to map CLIM onto websockets + CLOG".
+This project is that spike. The concrete question:
+
+#+begin_quote
+Can a CLIM medium drive a browser canvas through CLOG cleanly enough to be
+worth building a full backend on?
+#+end_quote
+
+* The end game: the UI for valis
+
+This backend is not an end in itself.  It is the rendering substrate for
+the *valis user interface* - the "face" of valis as, in Fade's words, "an
+actual computer over network protocols", not just another hosting play.
+The ambition is a *Lisp-machine-style UI delivered over the web*: the thing
+that distinguishes valis from a hosting product is that you operate it like
+a computer, through a live, typed, object-oriented interface, over the
+network.
+
+Shape of the target system (Fade's framing, 2026-06):
+
+- *Transport + rendering:* a *websocket <-> CLIM/WebGL* pipeline.  CLOG
+  supplies the websocket transport and the drawing surface (2D canvas now,
+  with ~clog-webgl~ available as a later target); ~clim-clog~ maps CLIM
+  onto it.  Phases 0-2 here establish the 2D-canvas path; WebGL is a future
+  rendering target for the same medium protocol.
+- *Object-capability mediation:* every interaction is to be mediated by
+  valis' *OCAP* (object-capability) interface.  Commands act on remote
+  objects through capabilities, never ambient authority.  This dovetails
+  with CLIM's presentation model (below): a presentation already ties a
+  visual to a typed application object - under valis that reference is a
+  capability.
+- *Interaction flow via continuations:* UCW's ~call~/~answer~ continuation
+  model (delimited continuations via a CPS code walker) is the leading
+  candidate for multi-step flows, mirroring CLIM's ~accepting-values~ and
+  command loop.  The heavy piece is ~arnesi~'s code walker, which can
+  likely be pulled out as a standalone dependency rather than adopting all
+  of UCW.  (See the UCW reference under Phase 2.)
+- *Sibling repositories / naming:* valis' protocol plugins live in a repo
+  Fade is calling *c3po* (a protocol droid).  This UI is a sibling effort
+  in the same family; Glenn leads it ("czar of the UI").  The repository
+  name is still to be chosen - see "Naming" below.
+
+* CLIM in context (why CLIM, culturally)
+
+CLIM (Common Lisp Interface Manager) is the standardised descendant of the
+*Lisp Machine* user-interface toolkits - Symbolics Genera's Dynamic
+Windows.  It was specified as CLIM I/II in the early 1990s (Symbolics,
+Franz, International Lisp Associates).  McCLIM is the maintained
+free-software implementation, and ~clim-clog~ is a McCLIM /backend/, so any
+CLIM application - including valis' UI - can target the browser unchanged.
+
+Its defining idea is the *presentation*: displayed output is semantically
+typed, linking a visual representation to an application object /and its
+presentation type/.  From this one idea fall out:
+
+- *context-sensitive input* - click any displayed object whose type the
+  current command wants;
+- the *command loop* and command processor;
+- ~accepting-values~ dialogs (the continuation-flavoured input flow);
+- *incremental redisplay* over live objects.
+
+Culturally this is the Lisp-machine worldview: the system is a space of
+live, typed, inspectable objects, and the UI is /generated from data and
+commands/ rather than hand-placed widgets.  That is precisely the idiom
+valis wants - "an actual computer over network protocols" - which is why
+Fade says "culturally, CLIM feels like the right thing", and why the goal
+is a faithful CLIM backend rather than a bespoke web widget toolkit.
+
+* Naming (valis UI repository)
+
+Fade's conventions mix two threads: the core is *valis* (Philip K. Dick's
+/VALIS/ - Vast Active Living Intelligence System), and the protocol-plugin
+repo is *c3po* (a Star Wars protocol droid).
+
+*Chosen name: ~ubik~* (PKD, /Ubik/).  In the novel Ubik is the
+reality-stabilising product that literally manifests /as the interface/
+keeping the world coherent - the perfect metaphor for the layer that makes
+the valis machine perceivable, and it keeps the PKD thread of valis itself.
+So: *ubik* is the valis UI repository (the CLIM application), and
+~clim-clog~ (this repo) is the McCLIM backend it renders through.
+
+Runners-up considered: ~artoo~/~r2d2~ (Star Wars sibling to c3po - the
+droid that jacks into terminals and projects the display) and ~perky-pat~
+(PKD, /Palmer Eldritch/).
+
+* Background: how a McCLIM backend is structured
+
+A McCLIM backend implements a handful of protocol classes. We model ours on
+the in-tree ~Backends/Null~ skeleton and the McCLIM maintainer's HTML5
+backend tutorial:
+
+- *Port* - the logical display connection. CLX wraps an X11 socket; we wrap
+  a CLOG connection + a ~<canvas>~ and its 2D context. Registered for the
+  ~:clog~ server-path designator via ~find-port-type~.
+- *Graft* - the "root window" sheet; reports the display dimensions. For us,
+  the canvas size.
+- *Medium* - holds the drawing context for a sheet; the ~medium-draw-*~
+  generic functions are specialised here. *This is the core of the mapping.*
+  ~medium-drawable~ returns the CLOG 2D context.
+- *Frame manager* - realises application frames/panes. Minimal for now.
+
+* The CLIM -> CLOG drawing map
+
+The key insight that makes CLOG a strong fit: the HTML5 Canvas 2D model is
+/imperative path drawing/, which is exactly CLIM's medium model. The
+tutorial emits JS strings; we call CLOG methods instead.
+
+| CLIM medium op         | CLOG canvas call(s)                                          |
+|------------------------+-------------------------------------------------------------|
+| ~medium-draw-line*~    | ~begin-path~ + ~move-to~ + ~line-to~ + ~path-stroke~        |
+| ~medium-draw-lines*~   | per segment: as above                                       |
+| ~medium-draw-polygon*~ | ~begin-path~ + ~move-to~/~line-to~ + (~close-path~) + fill/stroke |
+| ~medium-draw-rectangle*~ | ~fill-rect~ / ~stroke-rect~                               |
+| ~medium-draw-point(s)*~ | ~arc~ + ~path-fill~                                        |
+| ~medium-draw-ellipse*~ | ~arc~ (axis-aligned approximation for now)                  |
+| ~medium-draw-text*~    | set ~font-style~ + ~fill-text~                              |
+| ~medium-clear-area~    | ~clear-rect~                                                |
+| ink (solid colour)     | ~(setf (stroke-style/fill-style ctx) "rgb(...)")~           |
+| text style             | CSS ~font~ shorthand string                                 |
+| text metrics           | ~measure-text~ (currently estimated offline)                |
+
+* Roadmap
+
+** Phase 0 - output-only spike (DONE, v0.0.1)
+
+Prove the medium mapping by drawing a static scene to the canvas. No
+windowing, no input. Entry point: ~clim-clog::start~.
+
+** Phase 1 - real top-level sheets & frames
+
+- ~realize-mirror~ creates a canvas per mirrored (top-level) sheet.
+- Frame manager lays out panes; map CLIM gadgets either to McCLIM's own
+  pane-drawn gadgets (drawn through our medium) or to CLOG DOM widgets.
+- Make an actual ~clim:application-frame~ display on a CLOG page.
+
+** Phase 2 - input (DONE, the make-or-break for interactivity)
+
+*Status: working.* Browser pointer events drive the CLIM event loop end to
+end, confirmed visually (clicking the demo drops markers at the click).
+
+- ~clog:set-on-mouse-down/up/move~ handlers, installed on each mirror's
+  canvas in ~realize-mirror~, build CLIM events and push them onto a
+  lock-protected queue on the port (see ~src/input.lisp~).
+- ~initialize-instance~ calls ~restart-port~ to start McCLIM's port I/O
+  loop (a thread looping ~process-next-event~) - the single queue consumer.
+- ~process-next-event~ pops one event and ~distribute-event~s it into the
+  sheet hierarchy, reaching ~handle-event~ on the target pane.
+- Confirmed path: browser -> CLOG handler (worker thread) -> CLIM event ->
+  port queue -> port I/O loop -> distribute-event -> handle-event -> medium
+  draw -> browser.
+
+Remaining for a later pass: keyboard events (canvas needs focus/tabindex);
+the full presentation/command loop (clicking a /presented/ object to run a
+command) - the plumbing is proven, this is now an application-level concern.
+
+*Reference - UCW continuations.* [[https://github.com/erikg/ucw-core][UCW (UnCommon Web)]], in Quicklisp and still
+running on modern SBCL, models multi-page web flows as straight-line code
+using delimited continuations (~arnesi~'s CPS walker): a component can
+~call~ another and later ~answer~ a value back, suspending/resuming across
+HTTP requests. This is the same shape as CLIM's ~accepting-values~ dialogs
+and the command loop ("ask the user, suspend, resume with a value"). If the
+naive event-injection approach to the command loop proves awkward, UCW's
+~call~/~answer~ is the model to borrow for input flow -- complementary to
+CLOG, which handles transport + drawing. (Control flow, not rendering: UCW
+is not a drawing surface and does not replace the CLOG medium.)
+
+** Phase 3 - drawing fidelity
+
+- Line dashes (~set-line-dash~), full clipping regions (~path-clip~), general
+  (skewed) ellipses via context transforms, gradients/patterns, pixmaps,
+  ~medium-copy-area~.
+- Real text metrics by round-tripping ~measure-text~ over the websocket
+  (synchronous query), or a cached per-font metric table.
+
+** Phase 4 - the listener / editor
+
+- Reuse CLOG's listener + editor as the "Lisp machine" shell around CLIM
+  application frames.
+
+* Open questions / risks
+
+- *Input latency.* Pointer-motion-driven presentation highlighting over a
+  network websocket may feel laggy; Phase 2 must measure this. Mitigation: do
+  highlight/track hit-testing client-side where possible.
+- *Synchronous text metrics.* CLIM wants ~text-size~ synchronously during
+  layout; the browser has the real answer. Options: estimate (current), cache
+  per font, or block on a websocket round-trip.
+- *Per-connection state.* Each CLOG connection is a stateful session; a CLIM
+  frame is naturally single-session, which fits, but multi-user is out of
+  scope for the spike.
+
+* Comparison note (CLOG vs Fluxion)
+
+For a /faithful/ CLIM backend (this project), CLOG is the natural substrate:
+bidirectional websockets match CLIM's event loop and ~clog-canvas~ is a
+direct medium target. Fluxion's FRP + SSE + DOM-morphing model is excellent
+for declarative web apps but is a paradigm mismatch for CLIM's imperative,
+pointer-driven, retained-graphics model - it would mostly be reduced to a
+transport. Fluxion would shine for a /different/ goal: a new, CLIM-inspired
+/native-HTML/ toolkit (presentations -> components, value gadgets ->
+reactive cells), which does not run existing McCLIM apps.

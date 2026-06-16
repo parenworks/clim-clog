@@ -212,3 +212,35 @@ errors so a bad event cannot tear down the port I/O loop."
              (return (values nil :wait-function)))
            (when (and deadline (>= (get-internal-real-time) deadline))
              (return (values nil :timeout)))))))))
+
+;;; ------------------------------------------------------------------
+;;; Presentation highlighting on pointer motion
+;;;
+;;; McCLIM drives hover-highlighting from the command loop's input-context
+;;; wait handler (CLIMI::FRAME-INPUT-CONTEXT-WAIT-HANDLER).  That handler
+;;; fires only when a pointer-motion gesture lands in the *command-loop
+;;; stream's* input buffer -- i.e. the stream READ-FRAME-COMMAND reads from,
+;;; which is the frame's first application (or interactor) pane.  In a
+;;; multi-pane frame the pointer usually sits over a *different* pane, so the
+;;; command-loop stream never sees the motion, the wait handler is never
+;;; reached, and nothing is ever highlighted.  (A single-pane frame happens
+;;; to work because its one pane is also the command-loop stream.)
+;;;
+;;; Our port I/O loop delivers every event through DISTRIBUTE-EVENT; the
+;;; standard command loop then pulls each event off the shared frame queue
+;;; and runs HANDLE-EVENT on the sheet under the pointer *with*
+;;; *INPUT-CONTEXT* and *APPLICATION-FRAME* already bound.  We exploit that
+;;; here: on each motion event we re-run the wait handler against the pane
+;;; actually under the pointer, which highlights the applicable presentation
+;;; (CLIMI::FRAME-INPUT-CONTEXT-WAIT-HANDLER no-ops the redraw unless the
+;;; presentation under the pointer changed) or unhighlights when there is
+;;; none.  Leaving the pane clears any lingering highlight.
+;;; ------------------------------------------------------------------
+
+(defmethod handle-event :after ((sheet clim-stream-pane) (event pointer-motion-event))
+  (let ((frame *application-frame*))
+    (when (and frame *input-context*)
+      (climi::frame-input-context-wait-handler frame sheet event))))
+
+(defmethod handle-event :after ((sheet clim-stream-pane) (event pointer-exit-event))
+  (unhighlight-highlighted-presentation sheet))

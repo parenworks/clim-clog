@@ -5,7 +5,7 @@
 ;;;; (canvases / DOM nodes).  For the output-only spike we provide the
 ;;;; minimal subclass so a port can be constructed; ADOPT-FRAME is a no-op,
 ;;;; matching the Null backend.  Real frame/pane realisation is Phase 1 of
-;;;; the Roadmap (see DESIGN.md).
+;;;; the Roadmap (see DESIGN.org).
 
 (in-package #:clim-clog)
 

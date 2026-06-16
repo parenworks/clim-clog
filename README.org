@@ -11,18 +11,24 @@ CLOG" discussion.
 
 * Status
 
-*v0.0.1 - Phase 0: output-only spike.*
+*Phases 0-2 done, Phase 3 in progress: a CLIM application frame runs
+interactively in the browser, with the presentation/command loop working,
+double-buffered (no redisplay flash) and using real browser text metrics.*
 
 | Area                                                                            | State                               |
 |---------------------------------------------------------------------------------+-------------------------------------|
 | Port / graft / frame-manager skeleton                                           | done (modelled on ~Backends/Null~)  |
 | Medium drawing (line, lines, polygon, rectangle(s), point(s), ellipse, text)    | done, delegating to CLOG canvas     |
 | Solid-colour inks                                                               | done                                |
-| Text metrics                                                                    | approximate (offline estimate)      |
 | Coordinate transformations                                                      | applied per-op                      |
-| Line dashes, clipping regions, gradients/patterns                               | *not yet*                           |
-| Mirrored top-level sheets / real frames & panes                                 | *not yet* (Phase 1)                 |
-| Input (pointer / keyboard)                                                      | *not yet* (Phase 2)                 |
+| Mirrored top-level sheets / real frames & panes (Phase 1)                       | done                                |
+| Input - pointer & keyboard (Phase 2)                                            | done                                |
+| Presentation / command loop + hover highlighting                                | done                                |
+| Device-region clipping (bounding-rectangle)                                     | done                                |
+| Double buffering (no redisplay flash) (Phase 3)                                 | done                                |
+| Real browser text metrics (cached ~measure-text~) (Phase 3)                     | done                                |
+| True multi-rectangle / non-rectangular clipping                                 | *not yet* (Phase 3)                 |
+| Line dashes, skewed ellipses, gradients/patterns, pixmaps                       | *not yet* (Phase 3)                 |
 
 See [[file:DESIGN.org][DESIGN.org]] for the architecture and full roadmap.
 
@@ -30,8 +36,8 @@ See [[file:DESIGN.org][DESIGN.org]] for the architecture and full roadmap.
 
 ~clog-canvas.lisp~ is a near 1:1 Lisp wrapper over the HTML5 Canvas 2D API
 (~begin-path~, ~move-to~, ~line-to~, ~arc~, ~path-fill~, ~path-stroke~,
-~fill-text~, ~measure-text~, transforms, ...). Where the McCLIM HTML5
-backend tutorial emits JavaScript /strings/, here we call the equivalent
+~fill-text~, ~measure-text~, transforms, ...). Where the turtleware
+McCLIM-backends tutorial emits JavaScript /strings/, here we call the equivalent
 CLOG method and let CLOG marshal it over the websocket. CLOG's
 bidirectional connection also gives us the pointer/keyboard events we will
 need for interactivity in Phase 2, and it already ships a listener/editor
@@ -45,19 +51,31 @@ need for interactivity in Phase 2, and it already ships a listener/editor
 Local clones used during development live at ~~/SourceCode/McCLIM~ and
 ~~/SourceCode/clog~ (kept current with their upstreams).
 
-* Running the smoke test
+* Running the demos
+
+Each entry point starts the CLOG server and opens a browser tab.  Call
+~(clim-clog::stop)~ to shut the server down between demos.
 
 #+begin_src lisp
 (ql:quickload :clim-clog/examples)
-(clim-clog::start)        ; opens http://127.0.0.1:8080 in your browser
-;; ... a canvas with rectangles, a line, a polygon, an ellipse, points
-;;     and a line of text should appear ...
+
+;; Phase 0 - bare medium: a static scene drawn straight through MEDIUM-DRAW-*.
+(clim-clog::start)              ; rectangles, line, polygon, ellipse, points, text
+
+;; Phase 1 - a real CLIM application frame on a CLOG page.
+(clim-clog::start-frame)
+
+;; Phase 2 - input.
+(clim-clog::start-input-demo)   ; click to drop a marker
+(clim-clog::start-key-demo)     ; click to focus, then type
+(clim-clog::start-present-demo) ; click a presented shape to run its command
+
 (clim-clog::stop)
 #+end_src
 
-If the demo scene renders, the CLIM->CLOG drawing mapping is working and the
-spike has answered its question: *yes, a CLIM medium can drive a browser
-canvas through CLOG.* The next question (interactivity) is Phase 2.
+The spike's original question is answered: *yes, a CLIM medium can drive a
+browser canvas through CLOG* - and, as of Phase 2, the full presentation /
+command loop runs interactively over the websocket.
 
 * Layout
 
@@ -65,12 +83,13 @@ canvas through CLOG.* The next question (interactivity) is Phase 2.
 clim-clog.asd            ; "clim-clog" core + "clim-clog/examples"
 src/
   package.lisp           ; CLIM-CLOG package
-  port.lisp              ; CLOG-PORT: wraps the CLOG connection + canvas/context
+  port.lisp              ; CLOG-PORT: connection + canvas/context, mirrors, pointer
   graft.lisp             ; CLOG-GRAFT: the drawing surface as a sheet
   medium.lisp            ; CLOG-MEDIUM: the CLIM -> CLOG canvas drawing map
-  frame-manager.lisp     ; CLOG-FRAME-MANAGER: minimal for now
+  input.lisp             ; Phase 2: browser events -> CLIM event queue -> dispatch
+  frame-manager.lisp     ; CLOG-FRAME-MANAGER
 examples/
-  hello.lisp             ; runnable output-only smoke test
+  hello.lisp             ; runnable demos for Phases 0-2 (see "Running the demos")
 #+end_example
 
 * License

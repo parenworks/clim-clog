@@ -24,6 +24,25 @@
 (defvar *clog-server-path* '(:clog)
   "Default server path used when opening a clim-clog port.")
 
+;;; A pointer that caches its last known screen position.  McCLIM's
+;;; STANDARD-POINTER hardcodes POINTER-POSITION to (values 0 0) and errors on
+;;; SETF -- the comment in pointer.lisp says the backend is expected to track
+;;; the position from pointer events.  Presentation highlighting and pointer
+;;; documentation work by SYNTHESIZING a motion event at (POINTER-POSITION
+;;; pointer); without a live position the tracker always probes (0,0), finds
+;;; no presentation, and nothing highlights.  We update this from every CLOG
+;;; pointer event (see MAKE-CLOG-POINTER-EVENT in input.lisp).
+(defclass clog-pointer (standard-pointer)
+  ((x :initform 0 :accessor %clog-pointer-x)
+   (y :initform 0 :accessor %clog-pointer-y)))
+
+(defmethod pointer-position ((pointer clog-pointer))
+  (values (%clog-pointer-x pointer) (%clog-pointer-y pointer)))
+
+(clim-sys:defmethod* (setf pointer-position) (x y (pointer clog-pointer))
+  (setf (%clog-pointer-x pointer) x
+        (%clog-pointer-y pointer) y))
+
 (defclass clog-port (basic-port)
   ((id)
    ;; The CLOG object we create the canvas under (typically a window
@@ -40,8 +59,15 @@
    ;; PROCESS-NEXT-EVENT (see input.lisp).
    (event-queue :initform '() :accessor clog-port-event-queue)
    (event-lock  :initform (clim-sys:make-recursive-lock "clog event queue")
-                :reader clog-port-event-lock))
-  (:default-initargs :pointer (make-instance 'standard-pointer)))
+                :reader clog-port-event-lock)
+   ;; Phase 3: cache of real browser text metrics, keyed by CSS-font string
+   ;; (font-level ascent/descent/em-width) and by (css . char) for per-glyph
+   ;; widths.  CLIM asks for text-size synchronously during layout; we
+   ;; round-trip MEASURE-TEXT over the websocket once and remember the answer
+   ;; (the browser's metrics are stable for the life of the connection).
+   (text-metrics-cache :initform (make-hash-table :test 'equal)
+                       :reader clog-port-text-metrics-cache))
+  (:default-initargs :pointer (make-instance 'clog-pointer)))
 
 ;;; Backend registration.  The second value is the server-path parser; we
 ;;; pass the path through unchanged (IDENTITY), exactly like the Null
@@ -80,9 +106,53 @@
 (defclass clog-mirror ()
   ((canvas  :initarg :canvas  :reader clog-mirror-canvas)
    (context :initarg :context :reader clog-mirror-context)
-   (sheet   :initarg :sheet   :reader clog-mirror-sheet))
-  (:documentation "Backing object for a mirrored sheet: a CLOG canvas and
-its 2D context."))
+   (sheet   :initarg :sheet   :reader clog-mirror-sheet)
+   ;; Double buffering (Phase 3): the medium draws into an OFFSCREEN canvas;
+   ;; CLOG-MIRROR-FLUSH blits the whole offscreen onto the visible CANVAS in
+   ;; one DRAW-IMAGE op.  Without this each CLIM drawing op renders
+   ;; individually over the websocket, so a full redisplay visibly flashes
+   ;; (clear, then content pops back in).  See DESIGN.org Phase 3.
+   (offscreen-canvas  :initarg :offscreen-canvas  :reader clog-mirror-offscreen-canvas)
+   (offscreen-context :initarg :offscreen-context :reader clog-mirror-offscreen-context))
+  (:documentation "Backing object for a mirrored sheet: a visible CLOG canvas
+plus an offscreen canvas the medium draws into and that is blitted to the
+visible one (double buffering)."))
+
+(defun clog-mirror-flush (mirror)
+  "Blit MIRROR's offscreen canvas onto its visible canvas in a single
+DRAW-IMAGE.  This is the double-buffer page-flip."
+  (clog:draw-image (clog-mirror-context mirror)
+                   (clog-mirror-offscreen-canvas mirror)
+                   0 0))
+
+;;; ------------------------------------------------------------------
+;;; Pixmaps (Phase 3)
+;;;
+;;; A CLIM pixmap is an off-screen drawable the medium can render into and
+;;; later blit onto a sheet (MEDIUM-COPY-AREA / COPY-FROM-PIXMAP), the basis
+;;; for double-buffered application drawing, scrolling, and sprite-style
+;;; effects.  We back each one with its own hidden CLOG <canvas> + 2D context.
+;;; WITH-OUTPUT-TO-PIXMAP binds a medium's drawable to the pixmap (see
+;;; MEDIUM-DRAWABLE in medium.lisp) so the ordinary MEDIUM-DRAW-* protocol
+;;; renders into the pixmap's context.
+;;; ------------------------------------------------------------------
+
+(defclass clog-pixmap ()
+  ((canvas  :initarg :canvas  :reader clog-pixmap-canvas)
+   (context :initarg :context :reader clog-pixmap-context)
+   (width   :initarg :width   :reader pixmap-width)
+   (height  :initarg :height  :reader pixmap-height))
+  (:documentation "An off-screen CLOG canvas + 2D context backing a CLIM pixmap."))
+
+(defmethod pixmap-depth ((pixmap clog-pixmap))
+  ;; RGBA canvas backing store.
+  32)
+
+(defmethod deallocate-pixmap ((pixmap clog-pixmap))
+  (ignore-errors (clog:destroy (clog-pixmap-canvas pixmap))))
+
+;;; ALLOCATE-PIXMAP and the MEDIUM-COPY-AREA methods specialise on
+;;; CLOG-MEDIUM and so live in medium.lisp (compiled after this file).
 
 (defun %sheet-pixel-size (sheet port)
   "Return (values width height) in device pixels for SHEET, falling back to
@@ -101,14 +171,28 @@ the port's configured size when the sheet region is degenerate."
               (port was created without :body)."))
     (multiple-value-bind (w h) (%sheet-pixel-size sheet port)
       (let* ((canvas  (clog:create-canvas body :width w :height h))
-             (context (clog:create-context2d canvas)))
+             (context (clog:create-context2d canvas))
+             ;; Offscreen back-buffer the medium draws into (double
+             ;; buffering, Phase 3); hidden so it never paints to the page.
+             (offscreen (clog:create-canvas body :width w :height h :hidden t))
+             (offscreen-context (clog:create-context2d offscreen)))
+        ;; The visible context is used ONLY for the back-buffer blit.  With
+        ;; the "copy" composite mode a single DRAW-IMAGE replaces the whole
+        ;; visible canvas with the offscreen contents -- including any
+        ;; transparent (cleared) regions -- so a WINDOW-CLEAR on the buffer
+        ;; is reflected exactly, with no stale pixels and no intermediate
+        ;; clear that would flash.
+        (setf (clog:global-composite-operation context) "copy")
         ;; Keep a port-level handle so a bare medium (Phase 0 harness) and
         ;; PORT-FORCE-OUTPUT can still reach a context.
         (setf (clog-port-canvas port) canvas
               (clog-port-context port) context)
-        (let ((mirror (make-instance 'clog-mirror :canvas canvas
-                                                  :context context
-                                                  :sheet sheet)))
+        (let ((mirror (make-instance 'clog-mirror
+                                     :canvas canvas
+                                     :context context
+                                     :offscreen-canvas offscreen
+                                     :offscreen-context offscreen-context
+                                     :sheet sheet)))
           ;; Wire browser pointer/keyboard events on this canvas into the
           ;; CLIM event queue (see input.lisp).
           (install-clog-input-handlers port sheet canvas)
@@ -117,27 +201,66 @@ the port's configured size when the sheet region is degenerate."
 (defmethod destroy-mirror ((port clog-port) (sheet mirrored-sheet-mixin))
   (let ((mirror (sheet-direct-mirror sheet)))
     (when mirror
-      (ignore-errors (clog:destroy (clog-mirror-canvas mirror))))))
+      (ignore-errors (clog:destroy (clog-mirror-canvas mirror)))
+      (ignore-errors (clog:destroy (clog-mirror-offscreen-canvas mirror))))))
 
 (defmethod set-mirror-geometry ((port clog-port) (sheet mirrored-sheet-mixin) region)
   (multiple-value-bind (x1 y1 x2 y2) (bounding-rectangle* region)
     (let ((mirror (sheet-direct-mirror sheet)))
       (when mirror
         (let ((canvas (clog-mirror-canvas mirror))
+              (offscreen (clog-mirror-offscreen-canvas mirror))
               (w (ceiling (- x2 x1)))
               (h (ceiling (- y2 y1))))
           ;; The intrinsic <canvas> width/height attributes set the drawing
-          ;; surface size (not just the CSS box).
+          ;; surface size (not just the CSS box).  Keep the offscreen
+          ;; back-buffer the same size as the visible canvas.
           (ignore-errors
            (setf (clog:property canvas "width")  (princ-to-string w)
-                 (clog:property canvas "height") (princ-to-string h))))))
+                 (clog:property canvas "height") (princ-to-string h)
+                 (clog:property offscreen "width")  (princ-to-string w)
+                 (clog:property offscreen "height") (princ-to-string h))
+           ;; Setting a canvas's intrinsic size resets its 2D context state,
+           ;; so re-apply the blit composite mode on the visible context.
+           (setf (clog:global-composite-operation (clog-mirror-context mirror))
+                 "copy")))))
     (values x1 y1 x2 y2)))
+
+;;; The double-buffer page-flip hook.  CLIM's display functions only *record*
+;;; output; the actual drawing to the medium happens during repaint, when
+;;; DISPATCH-REPAINT replays the records.  REPAINT-SHEET is invoked on the
+;;; mirrored ancestor and recurses into its (non-mirrored) child panes, so an
+;;; :AFTER here fires exactly once after the whole subtree has been drawn into
+;;; the offscreen buffer -- covering the initial paint and every partial
+;;; repaint (e.g. presentation highlighting).  MEDIUM-FINISH-OUTPUT also
+;;; blits, for code paths that draw and explicitly finish output.
+(defmethod repaint-sheet :after ((sheet mirrored-sheet-mixin) region)
+  (declare (ignore region))
+  (let ((mirror (sheet-direct-mirror sheet)))
+    (when (typep mirror 'clog-mirror)
+      (ignore-errors (clog-mirror-flush mirror)))))
 
 (defmethod enable-mirror  ((port clog-port) (sheet mirrored-sheet-mixin)) nil)
 (defmethod disable-mirror ((port clog-port) (sheet mirrored-sheet-mixin)) nil)
 (defmethod shrink-mirror  ((port clog-port) (mirror mirrored-sheet-mixin)) nil)
 (defmethod raise-mirror   ((port clog-port) (sheet mirrored-sheet-mixin)) nil)
 (defmethod bury-mirror    ((port clog-port) (sheet mirrored-sheet-mixin)) nil)
+
+;;; CLIM sets a frame's title via (SETF SHEET-PRETTY-NAME), which calls
+;;; SET-MIRROR-NAME on the port; without a method the command loop dies the
+;;; first time the title is set (e.g. when a frame is enabled or a dialog is
+;;; run).  We reflect the name onto the browser document title.  SET-MIRROR-ICON
+;;; has no canvas equivalent, so it is a no-op.
+(defmethod set-mirror-name ((port clog-port) (sheet mirrored-sheet-mixin) name)
+  (let ((body (clog-port-body port)))
+    (when body
+      (ignore-errors
+       (setf (clog:title (clog:html-document body)) (princ-to-string name)))))
+  name)
+
+(defmethod set-mirror-icon ((port clog-port) (sheet mirrored-sheet-mixin) icon)
+  (declare (ignore icon))
+  nil)
 
 ;;; PROCESS-NEXT-EVENT and the CLOG input handlers live in input.lisp.
 
@@ -166,8 +289,11 @@ the port's configured size when the sheet region is degenerate."
   font-name)
 
 (defmethod port-modifier-state ((port clog-port)) nil)
-(defmethod (setf port-keyboard-input-focus) (focus (port clog-port)) focus)
-(defmethod port-keyboard-input-focus ((port clog-port)) nil)
+;; NOTE: do NOT stub PORT-KEYBOARD-INPUT-FOCUS / (SETF ...) here.  BASIC-PORT
+;; already implements them over its FOCUSED-SHEET slot, and DISTRIBUTE-EVENT
+;; for keyboard events routes through PORT-KEYBOARD-INPUT-FOCUS; overriding it
+;; to NIL silently drops every key event (it falls back to the top-level
+;; sheet instead of the focused pane).
 (defmethod port-force-output ((port clog-port)) nil)
 (defmethod set-sheet-pointer-cursor ((port clog-port) sheet cursor)
   (declare (ignore sheet cursor))

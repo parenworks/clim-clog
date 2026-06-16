@@ -95,8 +95,8 @@ droid that jacks into terminals and projects the display) and ~perky-pat~
 * Background: how a McCLIM backend is structured
 
 A McCLIM backend implements a handful of protocol classes. We model ours on
-the in-tree ~Backends/Null~ skeleton and the McCLIM maintainer's HTML5
-backend tutorial:
+the in-tree ~Backends/Null~ skeleton and the turtleware McCLIM-backends
+tutorial series (https://turtleware.eu/tag/clim.html):
 
 - *Port* - the logical display connection. CLX wraps an X11 socket; we wrap
   a CLOG connection + a ~<canvas>~ and its 2D context. Registered for the
@@ -121,12 +121,12 @@ tutorial emits JS strings; we call CLOG methods instead.
 | ~medium-draw-polygon*~ | ~begin-path~ + ~move-to~/~line-to~ + (~close-path~) + fill/stroke |
 | ~medium-draw-rectangle*~ | ~fill-rect~ / ~stroke-rect~                               |
 | ~medium-draw-point(s)*~ | ~arc~ + ~path-fill~                                        |
-| ~medium-draw-ellipse*~ | ~arc~ (axis-aligned approximation for now)                  |
+| ~medium-draw-ellipse*~ | unit-circle ~arc~ under an affine ~transform~ (exact, incl. skewed) |
 | ~medium-draw-text*~    | set ~font-style~ + ~fill-text~                              |
 | ~medium-clear-area~    | ~clear-rect~                                                |
 | ink (solid colour)     | ~(setf (stroke-style/fill-style ctx) "rgb(...)")~           |
 | text style             | CSS ~font~ shorthand string                                 |
-| text metrics           | ~measure-text~ (currently estimated offline)                |
+| text metrics           | ~measure-text~ round-trip, cached (offline estimate fallback) |
 
 * Roadmap
 
@@ -158,9 +158,30 @@ end, confirmed visually (clicking the demo drops markers at the click).
   port queue -> port I/O loop -> distribute-event -> handle-event -> medium
   draw -> browser.
 
-Remaining for a later pass: keyboard events (canvas needs focus/tabindex);
-the full presentation/command loop (clicking a /presented/ object to run a
-command) - the plumbing is proven, this is now an application-level concern.
+The full presentation/command loop now works: clicking a /presented/ object
+runs its command, and *hover highlighting* works too.  Two backend fixes were
+needed beyond raw event delivery:
+- ~clog-pointer~ (a ~standard-pointer~ subclass) caches the live cursor
+  position, updated from every pointer event in ~make-clog-pointer-event~.
+  McCLIM's ~standard-pointer~ hardcodes ~pointer-position~ to (0,0) and errors
+  on setf - the backend is expected to track it.  Presentation highlighting /
+  pointer-documentation /synthesize/ a motion event at ~pointer-position~, so
+  without this the tracker always probed (0,0) and nothing highlighted.
+- The medium now honours the device clipping region (~with-clipped-context~
+  via ~medium-device-region~).  Partial repaints (e.g. un-highlighting a
+  presentation) replay the output history clipped to a small region; without
+  clipping a full-extent record (the demo's background rectangle) repainted
+  the whole canvas and erased everything outside the region.
+
+Remaining for a later pass: keyboard events (canvas needs focus/tabindex).
+
+*Redisplay flashing - FIXED in Phase 3.* ~redisplay-frame-pane~ re-runs the
+display function, and each CLOG drawing op renders individually over the
+websocket, so a full redisplay used to visibly flash (whole canvas clears,
+then content pops back in).  Native backends hide this behind windowing-system
+buffering; a canvas has none.  This is now solved by *double buffering* (draw
+to an offscreen canvas, blit to the visible one in a single op per flush) -
+see Phase 3 below.
 
 *Reference - UCW continuations.* [[https://github.com/erikg/ucw-core][UCW (UnCommon Web)]], in Quicklisp and still
 running on modern SBCL, models multi-page web flows as straight-line code
@@ -175,11 +196,100 @@ is not a drawing surface and does not replace the CLOG medium.)
 
 ** Phase 3 - drawing fidelity
 
-- Line dashes (~set-line-dash~), full clipping regions (~path-clip~), general
-  (skewed) ellipses via context transforms, gradients/patterns, pixmaps,
-  ~medium-copy-area~.
-- Real text metrics by round-tripping ~measure-text~ over the websocket
-  (synchronous query), or a cached per-font metric table.
+- *Double buffering (DONE).* Each mirror now owns a hidden offscreen canvas
+  (~clog-mirror-offscreen-canvas~ / ~-context~).  ~medium-drawable~ returns
+  the offscreen context, so all CLIM drawing accumulates off-screen;
+  ~medium-finish-output~ / ~medium-force-output~ blit it to the visible
+  canvas with a single ~draw-image~ (~clog-mirror-flush~).  The visible
+  context is set to the ~"copy"~ composite mode once at ~realize-mirror~ (and
+  re-applied after any ~set-mirror-geometry~ resize, which resets context
+  state), so the blit /replaces/ the visible canvas exactly -- including
+  cleared/transparent regions from ~window-clear~ -- in one op, with no
+  intermediate clear that would flash.
+- *Real text metrics (DONE).* ~text-size~, ~text-style-ascent/descent/height~,
+  ~text-style-width~ and ~text-style-character-width~ now round-trip
+  ~clog:measure-text~ over the websocket: font-level ascent/descent come from
+  ~font-bounding-box-ascent/descent~, widths from the measured advance.
+  Results are cached on the port (~clog-port-text-metrics-cache~), keyed by
+  the CSS-font string (font metrics) and by ~(css . char)~ (per-glyph width),
+  since browser metrics are stable for the life of a connection.  When no
+  drawable context exists yet (space composition before the canvas is
+  realized) the old offline estimate is used as a fallback and not cached.
+  *Crucially, ~text-size~ computes a string's width as the sum of cached
+  per-glyph widths (~%line-width~) rather than measuring the whole substring*:
+  ~text-size~ is called on the growing input line on /every/ keystroke during
+  DREI redisplay, so measuring the substring blocked on a websocket round-trip
+  per keystroke (the cause of interactor input lag).  Summing cached glyph
+  widths costs one ~measure-text~ per distinct character ever, then zero.
+- *Text drawing transformation (gotcha, fixed).* Unlike every other
+  ~medium-draw-*~ generic, McCLIM's ~transform-coordinates-mixin~
+  ~:around~ method for ~medium-draw-text*~ is disabled (guarded by ~#+(or)~ in
+  =Core/drawing/medium.lisp=), so X/Y arrive in the medium's /user/ coordinate
+  system with the medium transformation NOT applied.  DREI / output-record
+  replay positions a text run by setting the medium transformation to
+  translate to the run origin and drawing the string at (0,0); our
+  ~medium-draw-text*~ must therefore apply ~medium-transformation~ itself
+  before the sheet native transformation.  Without this, every text run landed
+  at the pane origin -- outside its own clip rectangle -- so e.g. typed
+  interactor text was invisible while the caret (a shape, which /does/ get the
+  ~:around~) moved correctly.
+- *True multi-rectangle clipping (DONE).* ~with-clipped-context~ now builds one
+  canvas path from /every/ rectangle of the device region
+  (~map-over-region-set-regions~) before ~path-clip~, so a ~standard-rectangle-set~
+  clips to the union of its members rather than to a single bounding rectangle.
+  Non-rectangular sub-regions still fall back to their bounding box.
+- *Line dashes (DONE).* ~apply-stroke-state~ pushes ~line-style-dashes~ to the
+  canvas via ~set-line-dash~ (NIL = solid, T = default pattern, or a sequence of
+  segment lengths), reset on every stroke.
+- *General (skewed) ellipses (DONE).* Drawn by installing the affine map that
+  sends the unit circle to the ellipse (~transform~ with the two radius vectors
+  as columns) and tracing a unit ~arc~; exact for non-orthogonal radii.
+- *Pixmaps + ~medium-copy-area~ (DONE).* A ~clog-pixmap~ is a hidden off-screen
+  ~<canvas>~ + 2D context; ~allocate-pixmap~/~deallocate-pixmap~ manage it and
+  ~medium-drawable~ honours a pixmap bound via ~with-output-to-pixmap~.  All four
+  ~medium-copy-area~ combinations (medium/pixmap x medium/pixmap) move pixels
+  with ~get-image-data~ + ~put-image-data~ (CLOG's ~draw-image~ has no source
+  sub-rectangle form).  This backs ~copy-area~, ~copy-to/from-pixmap~ and
+  ~with-output-to-pixmap~.
+- Gradients/patterns as CLIM design inks.  ~(setf fill-style)~ accepts a CLOG
+  gradient/pattern object, but ~(setf stroke-style)~ does not, and CLIM's
+  indirect/tiled inks need rendering to an off-screen pattern; deferred as it
+  is rarely exercised by basic applications.  *(still to do)*
+
+** Interactive performance (best practice)
+
+The transport is a websocket, so the cost model is not "how many draw ops"
+but "how many /synchronous round-trips/":
+
+- *Drawing ops are fire-and-forget.* CLOG sends ~begin-path~, ~fill-rect~,
+  ~fill-text~, the double-buffer ~draw-image~ flush, etc. without waiting for
+  a reply, so they pipeline cheaply.  Redrawing a whole pane of shapes per
+  event is fine.
+- *Some ops block on a reply.* ~get-image-data~ (used by ~medium-copy-area~,
+  ~copy-area~, and pixmap blits) and ~measure-text~ (~text-size~) do a full
+  request/response round-trip.  Issuing one of these /per keystroke or per
+  pointer-motion/ is what makes interaction feel sluggish.
+- *Mitigations:* (1) keep ~measure-text~ cached per font/glyph AND build
+  string widths by summing cached glyph widths, never measuring a whole
+  substring on the hot path (done -- see ~clog-port-text-metrics-cache~ and
+  ~%line-width~/~text-size~); (2) in interactive handlers, repaint only
+  the region that changed rather than re-running a full display function that
+  contains a ~copy-area~/pixmap step; (3) reserve ~copy-area~ for genuine
+  scrolling, not per-frame effects.  The showcase demo (~start-showcase~)
+  illustrates this: its key/click handlers repaint a single row, while the
+  full scene (which includes a pixmap + ~copy-area~) is drawn only on
+  ~handle-repaint~.
+
+For a presentation-dense UI (ubik), pointer-motion highlighting is the case
+to watch -- but it is *already responsive* (verified): a ~mousemove~ enqueues
+a ~pointer-motion-event~ (browser -> server, one-way), CLIM hit-tests it, and
+the highlight is drawn with the same fire-and-forget ops as everything else,
+so there is *no blocking round-trip per hover*.  The Phase-2 enabler is the
+~clog-pointer~ that tracks the live cursor position (~standard-pointer~
+hardcodes (0,0), which would make the tracker always probe the origin and
+highlight nothing).  Client-side hit-testing (see Open questions) remains an
+*optional* future micro-optimization -- to avoid even sending motion events /
+doing server-side hit-testing -- not a correctness or responsiveness blocker.
 
 ** Phase 4 - the listener / editor
 
@@ -188,12 +298,17 @@ is not a drawing surface and does not replace the CLOG medium.)
 
 * Open questions / risks
 
-- *Input latency.* Pointer-motion-driven presentation highlighting over a
-  network websocket may feel laggy; Phase 2 must measure this. Mitigation: do
-  highlight/track hit-testing client-side where possible.
-- *Synchronous text metrics.* CLIM wants ~text-size~ synchronously during
-  layout; the browser has the real answer. Options: estimate (current), cache
-  per font, or block on a websocket round-trip.
+- *Input latency (RESOLVED / verified).* Pointer-motion-driven presentation
+  highlighting over the websocket is responsive: motion events are one-way
+  (browser -> server) and highlights draw with fire-and-forget ops, so there
+  is no blocking round-trip per hover (verified with ~start-present-demo~).
+  Client-side hit-testing remains an optional future micro-optimization, not a
+  blocker.
+- *Synchronous text metrics (RESOLVED).* CLIM wants ~text-size~ synchronously
+  during layout; the browser has the real answer.  We measure per font/glyph
+  via ~clog:measure-text~ once and cache it, and build string widths by
+  summing cached glyph widths (~%line-width~) -- so the per-keystroke hot path
+  does no synchronous round-trips at all.
 - *Per-connection state.* Each CLOG connection is a stateful session; a CLIM
   frame is naturally single-session, which fits, but multi-user is out of
   scope for the spike.

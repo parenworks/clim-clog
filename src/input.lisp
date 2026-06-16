@@ -53,34 +53,124 @@ The browser's Alt is mapped to CLIM's meta modifier."
 (defun make-clog-pointer-event (class sheet port data buttonp)
   "Construct a CLIM pointer event of CLASS for SHEET from a CLOG mouse
 event plist DATA.  When BUTTONP, include the :BUTTON slot."
-  (let ((args (list :sheet sheet
-                    :pointer (climi::port-pointer port)
-                    :x (getf data :x)
-                    :y (getf data :y)
-                    :modifier-state (clog-modifier-state data)
-                    :timestamp (get-internal-real-time))))
-    (when buttonp
-      (setf args (list* :button (clog-button data) args)))
-    (apply #'make-instance class args)))
+  (let ((pointer (climi::port-pointer port))
+        (x (getf data :x))
+        (y (getf data :y)))
+    ;; Cache the pointer's screen position.  Presentation highlighting and
+    ;; pointer documentation synthesize a motion event at (POINTER-POSITION
+    ;; pointer); CLOG reports canvas-relative coordinates, which are our
+    ;; graft/screen coordinates, so we record them here on every event.
+    (setf (pointer-position pointer) (values x y))
+    (let ((args (list :sheet sheet
+                      :pointer pointer
+                      :x x
+                      :y y
+                      :modifier-state (clog-modifier-state data)
+                      :timestamp (get-internal-real-time))))
+      (when buttonp
+        (setf args (list* :button (clog-button data) args)))
+      (apply #'make-instance class args))))
+
+;;; ------------------------------------------------------------------
+;;; Keyboard: browser KeyboardEvent.key -> CLIM keysym name + character
+;;; ------------------------------------------------------------------
+
+(defparameter *clog-key-name-map*
+  '(("Enter"      . :return)
+    ("Backspace"  . :backspace)
+    ("Tab"        . :tab)
+    ("Escape"     . :escape)
+    ("Delete"     . :delete)
+    ("Insert"     . :insert)
+    ("ArrowLeft"  . :left)
+    ("ArrowRight" . :right)
+    ("ArrowUp"    . :up)
+    ("ArrowDown"  . :down)
+    ("Home"       . :home)
+    ("End"        . :end)
+    ("PageUp"     . :prior)
+    ("PageDown"   . :next)
+    ("Shift"      . :shift-left)
+    ("Control"    . :control-left)
+    ("Alt"        . :meta-left)
+    ("Meta"       . :meta-left)
+    ("CapsLock"   . :caps-lock)
+    ("F1" . :f1) ("F2" . :f2) ("F3" . :f3)  ("F4" . :f4)
+    ("F5" . :f5) ("F6" . :f6) ("F7" . :f7)  ("F8" . :f8)
+    ("F9" . :f9) ("F10" . :f10) ("F11" . :f11) ("F12" . :f12))
+  "Map browser KeyboardEvent.key strings for non-printable keys to the CLIM
+keysym-name keywords (the X11 keysym names McCLIM uses, e.g. :RETURN).")
+
+(defun clog-key->name+char (key)
+  "Translate a browser KeyboardEvent.key string KEY to two values: the CLIM
+keysym name (a keyword) and, for a printable key, its character (else NIL).
+
+CLIM names the lower-case 'a' key :|a| and the upper-case key :|A|, so for a
+single-character KEY the keysym name is simply that character interned into
+the keyword package; multi-character names (\"Enter\", \"ArrowLeft\", ...) are
+looked up in *CLOG-KEY-NAME-MAP*."
+  (cond
+    ((or (null key) (zerop (length key)))
+     (values :void-symbol nil))
+    ((string= key " ")
+     (values :space #\Space))
+    ((= (length key) 1)
+     (values (intern key :keyword) (char key 0)))
+    (t
+     (values (or (cdr (assoc key *clog-key-name-map* :test #'string=))
+                 (intern (string-upcase key) :keyword))
+             nil))))
+
+(defun make-clog-key-event (class sheet data)
+  "Construct a CLIM keyboard event of CLASS for SHEET from a CLOG keyboard
+event plist DATA.  :KEY-CHARACTER is supplied only for printable keys; for
+the rest McCLIM derives the character (if any) from the keysym name."
+  (multiple-value-bind (key-name char)
+      (clog-key->name+char (getf data :key))
+    (let ((args (list :sheet sheet
+                      :key-name key-name
+                      :modifier-state (clog-modifier-state data)
+                      :timestamp (get-internal-real-time))))
+      (when char
+        (setf args (list* :key-character char args)))
+      (apply #'make-instance class args))))
 
 ;;; ------------------------------------------------------------------
 ;;; Handler installation
 ;;; ------------------------------------------------------------------
 
 (defun install-clog-input-handlers (port sheet canvas)
-  "Attach CLOG pointer handlers on CANVAS that enqueue CLIM events for
-SHEET (the top-level mirrored sheet) onto PORT's queue."
-  (flet ((handler (class buttonp)
+  "Attach CLOG pointer and keyboard handlers on CANVAS that enqueue CLIM
+events for SHEET (the top-level mirrored sheet) onto PORT's queue.
+
+A <canvas> is not focusable by default, so it receives no keyboard events.
+We give it tab-index 0 and focus it; the browser then routes keydown/keyup
+to it (and re-focuses it on click)."
+  (flet ((pointer-handler (class buttonp)
            (lambda (obj data)
              (declare (ignore obj))
              (handler-case
                  (clog-enqueue-event
                   port (make-clog-pointer-event class sheet port data buttonp))
                (error (e)
+                 (format *error-output* "~&[clim-clog input] ~a~%" e)))))
+         (key-handler (class)
+           (lambda (obj data)
+             (declare (ignore obj))
+             (handler-case
+                 (clog-enqueue-event port (make-clog-key-event class sheet data))
+               (error (e)
                  (format *error-output* "~&[clim-clog input] ~a~%" e))))))
-    (clog:set-on-mouse-down canvas (handler 'pointer-button-press-event   t))
-    (clog:set-on-mouse-up   canvas (handler 'pointer-button-release-event t))
-    (clog:set-on-mouse-move canvas (handler 'pointer-motion-event         nil)))
+    (clog:set-on-mouse-down canvas (pointer-handler 'pointer-button-press-event   t))
+    (clog:set-on-mouse-up   canvas (pointer-handler 'pointer-button-release-event t))
+    (clog:set-on-mouse-move canvas (pointer-handler 'pointer-motion-event         nil))
+    ;; Make the canvas keyboard-focusable and start capturing keystrokes.
+    ;; DISABLE-DEFAULT keeps Tab/Backspace/arrow keys inside the app instead
+    ;; of letting the browser act on them (focus traversal, history, scroll).
+    (setf (clog:tab-index canvas) 0)
+    (clog:set-on-key-down canvas (key-handler 'key-press-event) :disable-default t)
+    (clog:set-on-key-up   canvas (key-handler 'key-release-event))
+    (clog:focus canvas))
   (values))
 
 ;;; ------------------------------------------------------------------

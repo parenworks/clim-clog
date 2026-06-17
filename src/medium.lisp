@@ -570,13 +570,28 @@ whole substring would block on a round-trip per keystroke."
 ;;; Bounding rectangle of STRING relative to the text origin (baseline at
 ;;; y=0): the box extends BASELINE above (negative y) and the remaining
 ;;; height below.  Required by the output-recording machinery during
-;;; redisplay.  Estimated from our offline metrics for now.
+;;; redisplay.
+;;;
+;;; The CLIM contract is the *ink* box -- the tightest rectangle enclosing the
+;;; painted glyph marks -- which is what incremental redisplay erases (a pane's
+;;; ALWAYS-REPAINT-BACKGROUND-MIXIN paints the background over a changed
+;;; record's bounding rectangle before replaying).  TEXT-SIZE, however, returns
+;;; the *advance* box (the sum of per-glyph advances used to position the
+;;; cursor), and a glyph's ink can spill past its advance -- a trailing italic
+;;; stem, a 'W'/'f' overhang, or antialiasing fringe.  Returning the advance
+;;; box verbatim therefore under-covers the real ink, so when the input editor
+;;; shrinks a line (backspace/delete) the erase rectangle misses the rightmost
+;;; fringe of the old, longer line and leaves stale pixels behind.  We pad the
+;;; box by a font-relative margin so the ink is fully enclosed; this widens
+;;; only the *erase* extent and never the advance, so cursor positioning (which
+;;; reads TEXT-SIZE) is unaffected.
 (defmethod text-bounding-rectangle* ((medium clog-medium) string
                                      &key text-style (start 0) end)
   (multiple-value-bind (width height cursor-dx cursor-dy baseline)
       (text-size medium string :text-style text-style :start start :end end)
     (declare (ignore cursor-dx cursor-dy))
-    (values 0 (- baseline) width (- height baseline))))
+    (let ((pad (max 1 (ceiling (* 0.2 baseline)))))
+      (values (- pad) (- baseline) (+ width pad) (- height baseline)))))
 
 ;;; ------------------------------------------------------------------
 ;;; Output flushing -- the double-buffer page-flip.

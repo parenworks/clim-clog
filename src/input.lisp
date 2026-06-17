@@ -101,14 +101,30 @@ event plist DATA.  When BUTTONP, include the :BUTTON slot."
   "Map browser KeyboardEvent.key strings for non-printable keys to the CLIM
 keysym-name keywords (the X11 keysym names McCLIM uses, e.g. :RETURN).")
 
+;;; A few non-printable keys must carry an explicit character, because McCLIM
+;;; matches the input-editor's editing commands against the event's *character*
+;;; (e.g. forward-delete is bound to #\Rubout) and only derives that character
+;;; from the keysym name when the keysym table supplies one.  The Delete key is
+;;; the notable casualty: standard-keys.lisp defines :DELETE first with the
+;;; #\Delete character (DEFEDIT) and then *re-defines* it with no character
+;;; (DEFNAVI), so the derived character is lost and Delete matches nothing.  We
+;;; supply #\Rubout (code 127, == #\Delete) ourselves so the keysym clobbering
+;;; in McCLIM cannot strand the key.
+(defparameter *clog-key-char-map*
+  '(("Delete" . #\Rubout))
+  "Browser KeyboardEvent.key strings that must deliver an explicit character
+even though they are not printable, keyed for the gesture matcher.")
+
 (defun clog-key->name+char (key)
   "Translate a browser KeyboardEvent.key string KEY to two values: the CLIM
-keysym name (a keyword) and, for a printable key, its character (else NIL).
+keysym name (a keyword) and the character to attach (or NIL).
 
 CLIM names the lower-case 'a' key :|a| and the upper-case key :|A|, so for a
 single-character KEY the keysym name is simply that character interned into
 the keyword package; multi-character names (\"Enter\", \"ArrowLeft\", ...) are
-looked up in *CLOG-KEY-NAME-MAP*."
+looked up in *CLOG-KEY-NAME-MAP*.  A handful of named keys (*CLOG-KEY-CHAR-MAP*)
+additionally carry an explicit character so the gesture matcher can find their
+editing command even when McCLIM's keysym table derives none."
   (cond
     ((or (null key) (zerop (length key)))
      (values :void-symbol nil))
@@ -119,7 +135,7 @@ looked up in *CLOG-KEY-NAME-MAP*."
     (t
      (values (or (cdr (assoc key *clog-key-name-map* :test #'string=))
                  (intern (string-upcase key) :keyword))
-             nil))))
+             (cdr (assoc key *clog-key-char-map* :test #'string=))))))
 
 (defun make-clog-key-event (class sheet data)
   "Construct a CLIM keyboard event of CLASS for SHEET from a CLOG keyboard

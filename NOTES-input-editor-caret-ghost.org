@@ -1,0 +1,106 @@
+#+TITLE: Input-editor caret "ghost" artefacts on Backspace/Delete
+#+OPTIONS: toc:nil num:nil
+
+Status: *DEFERRED / unresolved.* Root cause identified, fix not landed.
+Date: 2026-06-16
+
+* Symptom
+
+When editing in a McCLIM input-editing stream rendered through the clim-clog
+(canvas) backend, deleting characters with Backspace/Delete leaves thin
+vertical caret "ghost" bars scattered to the right of the live caret, at the
+positions the caret previously occupied. Typing forward can leave them too.
+Arrow-key cursor movement does *not* ghost.
+
+* Diagnosis (ground truth from instrumented run, /tmp/caret.log)
+
+I traced three things during a backspace session:
+
+1. Each cursor draw (position, visibility, focus) in
+   =draw-design (sheet (cursor standard-text-cursor))=.
+2. The actual background-fill region in the =always-repaint-background-mixin=
+   =handle-repaint :before= (=Core/windowing/repaint.lisp=).
+3. The =old-bounds= captured per updating-output record in
+   =compute-new-output-records/invoke-displayer= (=Core/extended-output/redisplay.lisp=).
+
+Key observations:
+
+- There is only *one* cursor, always drawn =vis=ON focus=T= (red). The grey
+  appearance is just thin/antialiased red bars. No blink timer is involved.
+- The =BG-FILL= (erase) region for the editor panes always had its right edge
+  equal to the *new (current, shrunk) line bounds*, e.g. =region right = 128.7=
+  while the caret was at =122.0=. It never extended to the previous longer line.
+- The =OLD-BOUNDS= log showed the modified per-line records and the =EDITOR=
+  record as *=dirty=DELETE=*, not =:UPDATE=:
+
+  #+begin_example
+  OLD-BOUNDS #<LINE {..}> dirty=DELETE edges=(79.5 4.5 152.1 19.0)
+  OLD-BOUNDS EDITOR        dirty=DELETE edges=(79.5 4.5 152.1 19.0)
+  #+end_example
+
+* Root cause
+
+In =compute-difference-set=
+(=McCLIM/Core/extended-output/redisplay.lisp= ~lines 155-176), the erase set is
+built only from records whose dirty state is =:UPDATE=:
+
+#+begin_src lisp
+(dolist (record-1 (old-marked record))
+  (ecase (output-record-dirty record-1)
+    ((:select :modify))                       ; nothing
+    (:update (erases (list old-record (old-bounds record-1))))
+    (:delete                                   ; <-- NO erase, just decache
+     (delete-from-map ...))))
+#+end_src
+
+The input-editor's modified line records end up marked *=:DELETE=* (they are
+recreated rather than updated across redisplays — see the =:all-new (find line
+plan)= argument in =replay-input-buffer=,
+=McCLIM/Core/clim-core/input-editor/editing-stream.lisp=). Because =:DELETE=
+records are intentionally *not* added to ERASES (comment: "I don't want to
+erase it twice"), the old, *longer* bounds of a shrinking line are never
+cleared.
+
+The line is therefore only /incidentally/ cleared by the new (shorter) DRAW
+region. A ghost survives whenever the previous caret/glyph extends past that
+new region — i.e. whenever the just-deleted glyph is wider than the incidental
+coverage. This matches the irregular spacing of the ghost bars (wide glyphs
+ghost, narrow ones get covered).
+
+This is a *McCLIM core incremental-redisplay / input-editor interaction bug*,
+not a clim-clog backend bug. The clim-clog backend faithfully fills exactly the
+region McCLIM asks it to.
+
+* Why the attempted fix didn't work
+
+Padding the line's output record a few px past the caret (drawing an invisible
+marker in =replay-input-buffer=) correctly widened =old-bounds=, but it had no
+effect because the =:DELETE= records' =old-bounds= are never consulted by the
+erase path. Confirmed via the =BG-FILL= region staying at the new bounds.
+
+* Candidate fixes (for when this is revisited)
+
+1. *Make modified input-editor lines =:UPDATE= instead of recreated/=:DELETE=.*
+   Investigate why =:all-new (find line plan)= + =:unique-id line= +
+   =:cache-test (constantly t)= results in the old line record being orphaned
+   (=:DELETE=) rather than reused (=:UPDATE=). If they reused the record, the
+   old (longer) bounds would be erased correctly. This is the cleanest fix.
+
+2. *Erase =:DELETE= records too* in =compute-difference-set= (add their
+   =old-bounds=/=old-record= to ERASES). Risk: the "erase twice" concern the
+   existing comment warns about; needs care for overlapping/nested records.
+
+3. *Backend/full-line repaint workaround*: force the editor pane to repaint
+   its full line-strip width on each input-editor redisplay (double-buffered,
+   so no flash). Pragmatic but masks the core issue.
+
+* Reproduction
+
+- =sbcl --non-interactive --load /tmp/run-controls-demo.lisp= (serves on :8095).
+- Open the browser preview, click the =Command:= interactor line, type a string,
+  then hold Backspace. Ghost bars appear to the right of the caret.
+
+* Note
+
+All diagnostic instrumentation has been reverted; =git diff= in the McCLIM
+checkout is clean as of this writing.

@@ -211,19 +211,31 @@ the port's configured size when the sheet region is degenerate."
         (let ((canvas (clog-mirror-canvas mirror))
               (offscreen (clog-mirror-offscreen-canvas mirror))
               (w (ceiling (- x2 x1)))
-              (h (ceiling (- y2 y1))))
+              (h (ceiling (- y2 y1)))
+              (cur-w (ignore-errors
+                      (parse-integer (clog:property canvas "width")
+                                     :junk-allowed t)))
+              (cur-h (ignore-errors
+                      (parse-integer (clog:property canvas "height")
+                                     :junk-allowed t))))
           ;; The intrinsic <canvas> width/height attributes set the drawing
-          ;; surface size (not just the CSS box).  Keep the offscreen
-          ;; back-buffer the same size as the visible canvas.
-          (ignore-errors
-           (setf (clog:property canvas "width")  (princ-to-string w)
-                 (clog:property canvas "height") (princ-to-string h)
-                 (clog:property offscreen "width")  (princ-to-string w)
-                 (clog:property offscreen "height") (princ-to-string h))
-           ;; Setting a canvas's intrinsic size resets its 2D context state,
-           ;; so re-apply the blit composite mode on the visible context.
-           (setf (clog:global-composite-operation (clog-mirror-context mirror))
-                 "copy")))))
+          ;; surface size (not just the CSS box).  Writing EITHER attribute
+          ;; -- even to its current value -- resets the canvas bitmap to
+          ;; transparent, which on a visible canvas reads as a page flash.
+          ;; So only touch the bitmap when the size actually changes, and
+          ;; after a real resize immediately re-blit the offscreen so the
+          ;; viewer never sees the blanked frame between resize and repaint.
+          (unless (and (eql w cur-w) (eql h cur-h))
+            (ignore-errors
+             (setf (clog:property canvas "width")  (princ-to-string w)
+                   (clog:property canvas "height") (princ-to-string h)
+                   (clog:property offscreen "width")  (princ-to-string w)
+                   (clog:property offscreen "height") (princ-to-string h))
+             ;; Setting a canvas's intrinsic size resets its 2D context state,
+             ;; so re-apply the blit composite mode on the visible context.
+             (setf (clog:global-composite-operation (clog-mirror-context mirror))
+                   "copy")
+             (clog-mirror-flush mirror))))))
     (values x1 y1 x2 y2)))
 
 ;;; The double-buffer page-flip hook.  CLIM's display functions only *record*
